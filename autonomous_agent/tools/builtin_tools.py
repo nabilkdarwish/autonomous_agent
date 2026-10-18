@@ -210,39 +210,145 @@ class APICallerTool(BaseTool):
 
 
 # ──────────────────────────────────────────────────────────
-# 5. Python code executor (sandboxed)
+# 5. Restricted Python code runner
 # ──────────────────────────────────────────────────────────
 
 class CodeExecutorTool(BaseTool):
     name = "code_executor"
     description = (
-        "Execute a Python code snippet and return stdout output. "
-        "Useful for data processing, calculations, and transformations."
+        "Run a short, restricted Python snippet for small calculations and data transformations. "
+        "Imports, attribute access, filesystem and network access, and unbounded loops are blocked. "
+        "This is not an operating-system-level sandbox."
     )
     parameters = {
         "code": {
             "type": "string",
-            "description": "Python code to execute"
+            "description": "A short snippet using basic expressions, assignments, conditionals, and bounded for-loops."
         }
     }
 
-    _BLOCKED = ["import os", "import sys", "subprocess", "open(", "__import__",
-                "exec(", "eval(", "compile(", "shutil", "socket"]
+    _MAX_SOURCE_CHARS = 4000
+    _MAX_AST_NODES = 300
+    _MAX_RANGE_ITEMS = 1000
+    _MAX_OUTPUT_CHARS = 2000
+    _MAX_LOOP_DEPTH = 2
+    _ALLOWED_NODES = (
+        ast.Module, ast.Expr, ast.Assign, ast.AugAssign, ast.For, ast.If,
+        ast.Break, ast.Continue, ast.Pass, ast.Name, ast.Load, ast.Store,
+        ast.Constant, ast.List, ast.Tuple, ast.Set, ast.Dict, ast.BinOp,
+        ast.UnaryOp, ast.BoolOp, ast.Compare, ast.Call, ast.keyword,
+        ast.Subscript, ast.Slice, ast.Add, ast.Sub, ast.Mult, ast.Div,
+        ast.FloorDiv, ast.Mod, ast.UAdd, ast.USub, ast.Not, ast.And, ast.Or,
+        ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE, ast.In,
+        ast.NotIn, ast.Is, ast.IsNot,
+    )
 
     def execute(self, code: str) -> str:
-        for blocked in self._BLOCKED:
-            if blocked in code:
-                raise PermissionError(f"Blocked: '{blocked}' is not allowed in code executor")
-        import io, contextlib
-        stdout_buf = io.StringIO()
-        local_ns: Dict[str, Any] = {}
+        import contextlib
+
+        if not isinstance(code, str) or len(code) > self._MAX_SOURCE_CHARS:
+            raise ValueError(f"Code must be text with at most {self._MAX_SOURCE_CHARS} characters")
+
+        class OutputLimit:
+            def __init__(self, limit):
+                self.limit = limit
+                self.parts = []
+                self.size = 0
+
+            def write(self, value):
+                remaining = self.limit - self.size
+                if remaining > 0:
+                    piece = value[:remaining]
+                    self.parts.append(piece)
+                    self.size += len(piece)
+                return len(value)
+
+            def getvalue(self):
+                return "".join(self.parts)
+
+        output = OutputLimit(self._MAX_OUTPUT_CHARS)
+
+        def bounded_range(*args):
+            values = range(*args)
+            if len(values) > self._MAX_RANGE_ITEMS:
+                raise ValueError(f"range is limited to {self._MAX_RANGE_ITEMS} items")
+            return values
+
+        safe_builtins = {
+            "print": print,
+            "abs": abs,
+            "all": all,
+            "any": any,
+            "bool": bool,
+            "dict": dict,
+            "enumerate": enumerate,
+            "float": float,
+            "int": int,
+            "len": len,
+            "list": list,
+            "max": max,
+            "min": min,
+            "range": bounded_range,
+            "round": round,
+            "set": set,
+            "sorted": sorted,
+            "str": str,
+            "sum": sum,
+            "tuple": tuple,
+            "zip": zip,
+        }
+
         try:
-            with contextlib.redirect_stdout(stdout_buf):
-                exec(code, {"__builtins__": __builtins__}, local_ns)
-            output = stdout_buf.getvalue()
-            return output[:2000] if output else "(no output)"
+            tree = ast.parse(code, mode="exec")
+            nodes = list(ast.walk(tree))
+            if len(nodes) > self._MAX_AST_NODES:
+                raise ValueError(f"Snippet is limited to {self._MAX_AST_NODES} syntax nodes")
+
+            for node in nodes:
+                if not isinstance(node, self._ALLOWED_NODES):
+                    raise PermissionError(f"Blocked syntax: {type(node).__name__}")
+                if isinstance(node, ast.Name):
+                    if node.id.startswith("_"):
+                        raise PermissionError("Names beginning with underscore are blocked")
+                    if isinstance(node.ctx, ast.Store) and node.id in safe_builtins:
+                        raise PermissionError(f"Cannot overwrite built-in name: {node.id}")
+                if isinstance(node, ast.Call):
+                    if not isinstance(node.func, ast.Name) or node.func.id not in safe_builtins:
+                        raise PermissionError("Only approved built-in functions may be called")
+                if isinstance(node, (ast.Assign, ast.AugAssign)):
+                    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                    if any(not isinstance(target, ast.Name) for target in targets):
+                        raise PermissionError("Assignments are limited to local variable names")
+                if isinstance(node, ast.For) and not isinstance(node.target, ast.Name):
+                    raise PermissionError("For-loop targets are limited to local variable names")
+                if isinstance(node, ast.Constant):
+                    if isinstance(node.value, str) and len(node.value) > 1000:
+                        raise ValueError("Text values are limited to 1000 characters")
+                    if isinstance(node.value, int) and abs(node.value) > 1_000_000_000:
+                        raise ValueError("Integer literals are too large")
+                if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Pow):
+                    raise PermissionError("Exponentiation is not available in the code runner")
+                if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult):
+                    for operand in (node.left, node.right):
+                        if isinstance(operand, ast.Constant) and isinstance(operand.value, int) and abs(operand.value) > 1000:
+                            raise ValueError("Multiplication by large integer literals is blocked")
+
+            def check_loop_depth(node, depth=0):
+                if isinstance(node, ast.For):
+                    depth += 1
+                    if depth > self._MAX_LOOP_DEPTH:
+                        raise ValueError(f"For-loop nesting is limited to {self._MAX_LOOP_DEPTH}")
+                for child in ast.iter_child_nodes(node):
+                    check_loop_depth(child, depth)
+
+            check_loop_depth(tree)
+            namespace = {"__builtins__": safe_builtins}
+            with contextlib.redirect_stdout(output):
+                exec(compile(tree, "<restricted-code>", "exec"), namespace, namespace)
+            result = output.getvalue()
+            return result[: self._MAX_OUTPUT_CHARS] if result else "(no output)"
         except Exception as e:
-            raise RuntimeError(f"Code execution error: {e}")
+            raise RuntimeError(f"Restricted code execution failed: {e}")
 
 
 # ──────────────────────────────────────────────────────────
